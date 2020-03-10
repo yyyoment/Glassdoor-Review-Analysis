@@ -1,0 +1,471 @@
+---
+title: "Glassdoor Review Analysis"
+author: "[Yun Yan](https://github.com/yyyoment)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+# !!! You can add your social media info here. Mail, Linkedin, Instagram, Github, Twitter are now available. Or just delete the field for no social media icon.
+mail: "yyan5@nd.edu"
+linkedin: "yan-yun"
+github: "yyyoment"
+home: "yyyoment.github.io/yan-yun/"
+# !!! You need to provide a logo and background image here !!! Or just delete the field for no image
+logo: "logo.jpg"
+bg: "career15.jpg"
+# !!! You can specify the theme color here
+color: "#69b3a2"
+output:
+  ndrmd::ndrmd1:
+    toc: TRUE
+    number_sections: FALSE
+    code_folding: "show"
+---
+
+<style>
+div.color {
+    background-color:rgba(105, 179, 172, 0.15); 
+    border-radius: 9px; 
+    padding: 20px;
+    font-weight:500;
+    font-size: 18px;
+}
+</style>
+
+<br><br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE,message=FALSE,error=FALSE,fig.align="center")
+library(tidyverse)
+library(tm)
+library(tidytext)
+library(quanteda)
+library(gridExtra)
+library(circlize)
+library(sentimentr)
+library(lexicon)
+library(stm)
+library(rsample)
+library(keras)
+library(grid)
+```
+
+> The analysis focuses on the Glassdoor employee reviews of 4 organizations. The reviews are broken into 3 separate parts: pros, cons, and advice. 
+Using these reviews, sentiment analysis and topic modeling are conducted to find out the specific topics within a corpus of documents and predict the rating. The Pros and Cons from each review were treated as separate analyses to ease the interpretability of the analysis. 
+Learning the sentiments and topics associate with reviews of employees provided to a third party reviews website like Glassdoor might be useful intelligence for HRs and management board at the company in understanding its perceived strengths and weaknesses from an unfiltered employee perspective.
+
+# Load the Data
+***
+```{r cars}
+load('E:/Downloads/glassDoor.RData')
+
+gd_cl <- glassDoor %>% 
+  mutate(organization=as.factor(organization)) %>% 
+  mutate_at(c("rating","managementRating","workLifeRating","cultureValueRating","compBenefitsRating","careerOpportunityRating"),~as.numeric(as.character(.))) %>%
+  dplyr::select(-advice) %>% #too much NAs
+  filter(!is.na(iconv(pros,"latin1", "ASCII"))) %>%  # remove the rows with non-english words
+  filter(!is.na(iconv(cons,"latin1", "ASCII"))) 
+
+summary(gd_cl)
+```
+
+# Feel the Data
+***
+```{r}
+# distribution graph for each organization
+gd_cl %>% 
+  ggplot()+
+  geom_bar(aes(x=rating,fill=organization))+
+  facet_wrap(~organization)
+```
+<div class='color'>
+We can see that the rating distribution of four organization are alike, which means they may in a similar position within the industry. There are more rating of 4 and 5 than rating of 1 and 2. That is to say, there are usually more employees that are satisfied with the company/organization than those who are not.
+</div>
+
+# Clean the Text
+***
+While the text is generally clean, there are still some problems. Some words ran together and non-English texts are there. I cleansed the corpus for the pros and cons reviews with `tm`, `qdap` and `textstem` package.
+
+```{r}
+pros_source <- VectorSource(gd_cl$pros) # interprets each element as a DSI. 
+pros_corpus <- VCorpus(pros_source) # creates volatile Corpus object. 
+
+cons_source <- VectorSource(gd_cl$cons)
+cons_corpus <- VCorpus(cons_source)
+
+# create a function to clean the corpus
+clean_corpus <- function(corpus){
+
+  # http://bit.ly/2lfOfG2. require instead of library w/in function call. 
+  require(tm) 
+  require(qdap)
+  require(magrittr)
+  require(textstem)
+  
+  # remove the non-english words
+  non_english <- content_transformer(function(x) iconv(x,"latin1", "ASCII", sub=""))
+  corpus <- tm_map(corpus, non_english)
+  
+  # manual replacement with spaces. removePunctuation() will not do this.
+  to_space <- content_transformer(function(x, pattern) gsub(pattern, " ", x))
+  # deal with the words run together.
+  together <- content_transformer(function(x, pattern) gsub(pattern, "\\1 \\2", x))
+  corpus <- tm_map(corpus, together, "([a-z])([A-Z])")
+  corpus <- tm_map(corpus, to_space, "\\.")   # sometimes no space b/w sentences and period.
+
+  corpus <- corpus %>%
+    tm_map(stripWhitespace) %>% 
+    tm_map(removeNumbers) %>% # I noticed numbers are messy to work with. 
+    tm_map(content_transformer(replace_symbol)) %>% # qdap. e.g. % = 'percent'
+    tm_map(removePunctuation) %>% # including curly {} and round () brackets.
+    tm_map(content_transformer(replace_contraction)) %>% # qdap. e.g. shouldn't replaced by 'should not'
+    tm_map(content_transformer(replace_abbreviation)) %>% # qdap. data(abbreviations)
+    tm_map(removeWords, c(stopwords("english"),"ORGA","ORGB","ORGC","ORGD")) %>% 
+    tm_map(content_transformer(tolower)) %>% 
+    tm_map(removeWords, c(stopwords("english"),"und","gute")) %>% 
+    tm_map(str_squish) %>% 
+    tm_map(lemmatize_strings)
+  return(corpus)
+}
+
+pros_corpus_clean <- clean_corpus(pros_corpus)
+cons_corpus_clean <- clean_corpus(cons_corpus)
+pros_corpus[[6]][[1]];pros_corpus_clean[[6]][[1]]
+```
+
+We can compare the reviews before and after the cleansing.
+
+Then, we try to bind the cleansed pro and con reviews back to the original dataframe.
+
+```{r}
+pros_clean <- vector("character", nrow(gd_cl))
+for (text in 1:nrow(gd_cl)) {
+  pros_clean[text] <- pros_corpus_clean[[text]][[1]]
+}
+
+cons_clean <- vector("character", nrow(gd_cl))
+for (text in 1:nrow(gd_cl)) {
+  cons_clean[text] <- cons_corpus_clean[[text]][[1]]
+}
+
+gd_cl1 <- bind_cols(gd_cl,data.frame(pros_clean, stringsAsFactors = FALSE), 
+                          data.frame(cons_clean, stringsAsFactors = FALSE))
+
+# remove tm corpus source and original corpus. 
+remove(pros_clean, cons_clean, pros_corpus, cons_corpus, pros_source, cons_source)
+```
+
+# Top N Analysis
+***
+```{r}
+# top words
+gd_cl_top_p <- gd_cl1 %>% 
+  unnest_tokens(output=word,input=pros_clean) %>% 
+  anti_join(stop_words) %>% 
+  group_by(organization) %>% 
+  count(word) %>% 
+  na.omit() %>% 
+  top_n(10)
+
+gd_cl_top_c <- gd_cl1 %>% 
+  unnest_tokens(output=word,input=cons_clean) %>% 
+  anti_join(stop_words) %>% 
+  group_by(organization) %>% 
+  count(word) %>% 
+  na.omit() %>% 
+  top_n(10)
+
+for (i in c('ORGA','ORGB','ORGC','ORGD')){
+assign(i, gd_cl_top_p %>% 
+  filter(organization==i) %>% 
+  ggplot(aes(x=reorder(word,-n),y=n)) +
+  geom_col()+
+  theme(axis.text.x=element_text(angle=45, hjust=1))+
+  theme(legend.position = "none")+
+  theme(axis.title.x = element_blank())
+)
+}
+
+grid.arrange(ORGA,ORGB,ORGC,ORGD,top = textGrob("Pros",gp=gpar(fontsize=20,font=3)))
+
+for (i in c('ORGA','ORGB','ORGC','ORGD')){
+assign(i, gd_cl_top_c %>% 
+  filter(organization==i) %>% 
+  ggplot(aes(x=reorder(word,-n),y=n)) +
+  geom_col()+
+  theme(axis.text.x=element_text(angle=45, hjust=1))+
+  theme(legend.position = "none")+
+  theme(axis.title.x = element_blank())
+)
+}
+grid.arrange(ORGA,ORGB,ORGC,ORGD,top = textGrob("Cons",gp=gpar(fontsize=20,font=3)))
+```
+<div class='color'>
+We got the Top 10 popular words in Pros and Cons for each organization. It seems that people tend to talk about something about **people/employee, client and learn/opportunity** when talking about pros no matter which organization they are in. When it comes to cons reviews, the most popular words are **time, pay, management and people/management**. HR managers and management boards should pay attention to it when seeking for directions to improve employees' satisfactions.
+</div>
+<br>
+For better visualization purpose, I plotted a circle graph to illustrate the proportion of count number for each word and the overlapping top word for the 4 chosen organizations. 
+
+```{r}
+my_colors <- c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#D55E00", "#D65E00")
+
+grid.col_p = c("ORGA" = my_colors[1], "ORGB" = my_colors[2], "ORGC" = my_colors[3], "ORGD" = my_colors[4], "benefits" = "grey", "company" = "grey", "culture" = "grey", "employees" = "grey", "environment" = "grey", "management" = "grey", "opportunities" = "grey", "people" = "grey","team" = "grey","time" = "grey","experience" = "grey","learn" = "grey","clients" = "grey","office" = "grey","pay" = "grey","projects" = "grey","staff" = "grey")
+
+grid.col_c = c("ORGA" = my_colors[1], "ORGB" = my_colors[2], "ORGC" = my_colors[3], "ORGD" = my_colors[4], "company" = "grey", "consulting" = "grey", "dont" = "grey", "employees" = "grey", "hours" = "grey", "job" = "grey", "management" = "grey", "pay" = "grey","people" = "grey","staff" = "grey","time" = "grey","training" = "grey","office" = "grey","lack" = "grey","salary" = "grey","firm" = "grey","projects" = "grey")
+
+circos.clear()
+#Set the gap size
+circos.par(gap.after = c(rep(5, length(unique(gd_cl_top_p[[1]])) - 1), 15,
+                         rep(5, length(unique(gd_cl_top_p[[2]])) - 1), 15))
+chordDiagram(gd_cl_top_p, grid.col = grid.col_p, transparency = .2)
+
+circos.clear()
+#Set the gap size
+circos.par(gap.after = c(rep(5, length(unique(gd_cl_top_c[[1]])) - 1), 15,
+                         rep(5, length(unique(gd_cl_top_c[[2]])) - 1), 15))
+chordDiagram(gd_cl_top_c, grid.col = grid.col_c, transparency = .2)
+```
+<div class='color'>
+As for pros, we can see that people mentioned **people, management and learn** more than other words. All four organization may be doing a great job in terms of *training*. Also, we can see from the graph that the *benefit* in organization A and C are really attractive and the *project* in organization C and D are satisfying to employees.
+
+As for cons, employees care about the **employee, management and time** a lot. The leadership board of all four organization might want to focus on improving the *time management and scheduling*. Also, the leaders of organization A and D might want to further investigate problems on *client* since the client word are mentioned multiple times in the cons reviews for them. There might also be some issues on the *office* of organization C explicitly.
+
+In general, since the word **people and management** are mentioned a lot in both pros and cons reviews, they are something that people always care about. I would suggest the leaders to make efforts to *hire more talented people, choose appropriate management style and create pleasant working environment*.
+</div>
+
+# Sentiment Analysis
+***
+
+```{r}
+# sentiment analysis
+
+gd_cl2 <- gd_cl1
+#pro <-  sentiment(get_sentences(gd_cl1$pros), 
+#          polarity_dt = lexicon::hash_sentiment_jockers) %>% 
+#  group_by(element_id) %>% 
+#  summarize(meanSentiment = mean(sentiment))
+#
+#con <-  sentiment(get_sentences(gd_cl1$cons), 
+#          polarity_dt = lexicon::hash_sentiment_jockers) %>% 
+#  group_by(element_id) %>% 
+#  summarize(meanSentiment = mean(sentiment))
+
+gd_cl2$label <- seq.int(nrow(gd_cl2))
+
+senti <- gd_cl2 %>% 
+  unnest_tokens(output=word,input=pros_clean) %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(label) %>% 
+  summarize(meanSentiment_p = mean(value)) %>% 
+  left_join(gd_cl2)
+
+senti2 <- senti %>% 
+  unnest_tokens(output=word,input=cons_clean) %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(label) %>% 
+  summarize(meanSentiment_c = mean(value)) %>% 
+  left_join(senti)
+
+senti2 %>% 
+  mutate(title2=factor(organization,levels=c('ORGA','ORGB','ORGC','ORGD'))) %>% 
+  group_by(organization) %>%
+  summarize(pros = mean(meanSentiment_p),
+         cons = mean(meanSentiment_c),) %>% 
+  gather(senti,value,2:3) %>% 
+  ggplot(aes(organization,value,fill=organization))+
+  geom_col()+
+    theme(panel.grid = element_blank(),
+        panel.background=element_rect(fill="white",color="grey50"))+
+  facet_wrap(~factor(senti,levels=c('pros','cons')))
+
+```
+<div class='color'>
+The graphs shows the ranking relationship of the pros and cons sentiment scores of different organizations. Organization D always receives a *higher* sentiment score than other organizations, which means that it might be a relatively better company among the four companies. Another interesting thing here is employees in organization B tend to talk the pros in a relatively negative way and talk the cons in a relatively positive way.
+</div>
+
+```{r}
+lm <- lm(data=senti2,rating~meanSentiment_p+meanSentiment_c)
+summary(lm)
+```
+<div class='color'>
+According to the linear regression model summary, we can see that two sentiment score variables all passed the t-test and the coefficients are quite significant. 
+
+When the sentiment scores of pro and con are all zero, the rating would be 2.75. It is close to 2.5 -- the 50th percentile and it makes sense because this is the average score people would give when no strong emotions are involved. Looking at the coefficients, we can see the rating would goes up when sentiment scores increase. Also, the sentiment score of pros have a stronger effect than the sentiment score of cons.
+
+In addition, the R-squared is only (.07101), which means that the independent variables can only explain 7% of the variabilities of the rating. I think more information and data is needed here to improve our model.
+</div>
+
+# Topic Modeling
+***
+
+Since pros reviews have higher impact on the ratings, I decided to conduct topic modelings on it to find out what are the common topics that people would talk about when describing the strengths of a company.
+
+```{r}
+# topic modeling - pro
+set.seed(1001)
+
+Text = textProcessor(documents = gd_cl2$pros_clean, 
+                          metadata = gd_cl2, 
+                          stem = FALSE)
+
+Prep = prepDocuments(documents = Text$documents, 
+                               vocab = Text$vocab,
+                               meta = Text$meta)
+
+kTest = searchK(documents = Prep$documents, 
+             vocab = Prep$vocab, 
+             K = c(3, 4, 5, 10, 20), verbose = FALSE)
+
+plot(kTest)
+```
+
+Based on the Residuals and Semantic Coherence results, we choose **5** as the number of topics for the model to take.
+
+```{r}
+topics5 = stm(documents = Prep$documents, 
+             vocab = Prep$vocab, seed = 1001,
+             K = 5, verbose = FALSE)
+plot(topics5)
+data.frame(t(labelTopics(topics5, n = 10)$prob))
+```
+<div class='color'>
+Based on the top words, we can draw some conclusions on topics here.
+
+- Topic 1: Company Culture & Value
+- Topic 2: Senior Management
+- Topic 3: Work-Life Balance
+- Topic 4: Training/Learning Opportunities
+- Topic 5: People-Related (Client & Team)
+
+Surprisingly, the topic modeling result significantly aligns with the rating categories on Glassdoor website (managementRating, workLifeRating, cultureValueRating, compBenefitsRating and careerOpportunityRating). It might be the best way to break down the evaluation on a company.
+</div>
+
+```{r}
+topicPredictor = stm(documents = Prep$documents,
+             vocab = Prep$vocab, prevalence = ~ rating,
+             data = Prep$meta, K = 5, verbose = FALSE)
+
+ratingEffect = estimateEffect(1:5 ~ rating, stmobj = topicPredictor,
+               metadata = Prep$meta)
+summary(ratingEffect, topics = c(1:5))
+
+par(mfrow=c(2,3))
+for (n in c(1:5)){
+plot.estimateEffect(ratingEffect, "rating", method = "continuous",
+                    model = topicPredictor, topics = n, labeltype = "frex")
+}
+```
+<div class='color'>
+I conducted an effect estimation of the topic prevalence across different ratings. Except for the Topic 3, coefficients of rating in other topics are all signicant. In general, Topic 1&2 are mentioned more in pro reviews with lower ratings while the Topic 4&5 are mentioned more when rating are higher.
+</div>
+
+# CNN
+***
+
+```{r}
+# Deep Learning - predict the rating(for internal year review)
+gd_cl2$com <- paste(gd_cl2$pros_clean,gd_cl2$cons_clean)
+gd_cl3 <- gd_cl2 %>% 
+  mutate(rating=rating-1) %>% 
+  dplyr::select(com,rating)
+  
+splits = initial_split(gd_cl3, .6, "rating")
+
+trainingDataWhole = training(splits)
+testingDataWhole = testing(splits)
+
+trainingLabel = as.vector(trainingDataWhole$rating)
+trainingData = as.array(trainingDataWhole[, -c(2)])
+testingLabel = as.vector(testingDataWhole$rating)
+testingData = as.array(testingDataWhole[, -c(2)])
+
+tokenizerTrain = text_tokenizer(num_words = 50000)
+fit_text_tokenizer(tokenizerTrain, trainingData)
+trainingData = texts_to_sequences(tokenizerTrain, trainingData)
+tokenizerTest = text_tokenizer(num_words = 50000)
+fit_text_tokenizer(tokenizerTest, testingData)
+testingData = texts_to_sequences(tokenizerTest, testingData)
+
+vectorize_sequences <- function(sequences, dimension = 10000) {
+  # Creates an all-zero matrix of shape (length(sequences), dimension)
+  results <- matrix(0, nrow = length(sequences), ncol = dimension) 
+  for (i in 1:length(sequences))
+    # Sets specific indices of results[i] to 1s
+    results[i, sequences[[i]]] <- 1 
+  results
+}
+
+
+trainingData = pad_sequences(trainingData, value = 0,
+                             padding = "post", maxlen = 400)
+testingData = pad_sequences(testingData, value = 0,
+                            padding = "post", maxlen = 400)
+```
+
+```{r}
+vocabSize = 50000
+
+#continuous output
+#model <-  keras_model_sequential() %>% 
+#  layer_embedding(input_dim = vocabSize, output_dim = 16) %>%
+#  layer_global_average_pooling_1d() %>%
+#  layer_dense(units = 16, activation = "relu") %>%
+#  layer_dense(units = 1) %>%
+#  compile(
+#    optimizer = "rmsprop",
+#    loss = "mse",
+#    metrics = c("mae")
+#  )
+
+#multi-categorical output
+model <-  keras_model_sequential() %>% 
+  layer_embedding(input_dim = vocabSize, output_dim = 16) %>%
+  layer_global_average_pooling_1d() %>%
+  layer_dense(units = 128, activation = "relu",kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 5, activation = 'softmax') %>%
+  compile(
+    optimizer = 'adam', 
+    loss = 'sparse_categorical_crossentropy',
+    metrics = c('accuracy')
+  )
+
+
+xValidation = trainingData[1:500, ]
+xTraining = trainingData[501:nrow(trainingData), ]
+yValidation = trainingLabel[1:500]
+yTraining = trainingLabel[501:length(trainingLabel)]
+
+history = model %>% 
+  keras::fit(xTraining, yTraining,
+             epochs = 120, batch_size = 20,
+             validation_data = list(xValidation, yValidation),
+             verbose = 3,
+             callbacks = list(
+    #callback_early_stopping(patience = 10),
+    callback_reduce_lr_on_plateau()
+  ))
+```
+
+```{r}
+# test data
+model %>% evaluate(testingData, testingLabel)
+```
+
+<center><div style="text-align: center;height:60%;width:60%">![link](https://github.com/yyyoment/photos/raw/master/Rplot07.png)</div></center>
+<br>
+<div class='color'>
+According to the graph, we can tell that there is an overfitting problem since the training accuracy is too high and the performance of CNN model is not pleasant on both validation and test data. Also, the loss and accuracy lines are not very smooth. More model tuning (on lost function and learning rate) and more data as well as information is needed here. As its accuracy on test data is only 26.33% so far, we'd better go with the linear regression model for prediction right now.
+</div>
+
+# Last Thoughts
+***
+<div class='color'>
+By exploring the sentiments and topic behind texts, people might be able to get a sense of the 'real rating' instead of looking at a number came up subjectively. When applied to larger datasets of text documents that organizations may collect and store internally (e.g. call center logs, employee yearly review), decision makers may be able to access and draw insightful conclusions about patterns in text data collected over time. Such insights can be used to simply better understand the business, help inform strategy, or these insights may be combined with other data sources to perform additional analytical tasks. 
+
+In addition, if we can have a model with good predictive power on texts, we can skip the rating part for employee on the website to release the employee from the dilemma between feeling guilty if giving a low rating and feeling uncomfortable if giving a false high rating, and ratings can be directly derived from the texts.
+
+However, there are still some limitations.
+
+- Such words like 'Not Good', which represents negative emotions, might be recognized as 'Good' during the text analysis process. It may cause a opposite sentiment score and inaccurate analysis result. 
+
+- More factors can be taken into consideration when predicting the rating. For example, we can get the information whether the review is from a current employee or a former employee from Glassdoor website.
+</div>
